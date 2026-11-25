@@ -67,8 +67,8 @@ fi
   -I "${ANDROID_JAR}" \
   --min-sdk-version 31 \
   --target-sdk-version 31 \
-  --version-code 20 \
-  --version-name 2.0 \
+  --version-code 21 \
+  --version-name 2.1 \
   -o "${BUILD_DIR}/base.apk"
 
 mapfile -t JAVA_SOURCES < <(

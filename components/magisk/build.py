@@ -906,8 +906,15 @@ def parse_args():
 def main():
     global args
     args = parse_args()
-    args.config = Path(args.config).resolve()
-    os.chdir(Path(__file__).resolve().parent)
+
+    project_root = Path(__file__).resolve().parent
+    os.chdir(project_root)
+
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = project_root / config_path
+    args.config = config_path.resolve()
+
     load_config()
     args.func()
 

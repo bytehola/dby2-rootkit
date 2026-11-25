@@ -36,7 +36,7 @@ class DeviceSnapshot:
     vector_error: str
     system_server_pid: str
     surfaceflinger_pid: str
-    persistent_adb_port: str
+    boot_adb_port: str
 
     def identity(self) -> dict[str, str]:
         return {
@@ -70,7 +70,7 @@ class DeviceSnapshot:
             "vector_error": self.vector_error,
             "system_server_pid": self.system_server_pid,
             "surfaceflinger_pid": self.surfaceflinger_pid,
-            "persistent_adb_port": self.persistent_adb_port,
+            "boot_adb_port": self.boot_adb_port,
         }
 
 
@@ -101,7 +101,7 @@ printf 'kernel=%s\n' "$(uname -r)"
 printf 'boot_id=%s\n' "$(cat /proc/sys/kernel/random/boot_id)"
 printf 'selinux_mode=%s\n' "$(getenforce)"
 printf 'shell_identity=%s\n' "$(id)"
-printf 'persistent_adb_port=%s\n' "$(getprop persist.adb.tcp.port)"
+printf 'boot_adb_port=%s\n' "$(getprop service.adb.tcp.port)"
 printf 'system_server_pid=%s\n' "$(pidof system_server | awk '{ print $1 }')"
 printf 'surfaceflinger_pid=%s\n' "$(pidof surfaceflinger | awk '{ print $1 }')"
 """.strip()
@@ -285,7 +285,7 @@ def collect_snapshot(client: AdbClient) -> DeviceSnapshot:
     boot_id = identity_values.get("boot_id", "")
     selinux_mode = identity_values.get("selinux_mode", "")
     shell_identity = identity_values.get("shell_identity", "")
-    persistent_adb_port = identity_values.get("persistent_adb_port", "")
+    boot_adb_port = identity_values.get("boot_adb_port", "")
     system_server_pid = identity_values.get("system_server_pid", "")
     surfaceflinger_pid = identity_values.get("surfaceflinger_pid", "")
 
@@ -326,5 +326,5 @@ def collect_snapshot(client: AdbClient) -> DeviceSnapshot:
         vector_error=vector_error,
         system_server_pid=system_server_pid,
         surfaceflinger_pid=surfaceflinger_pid,
-        persistent_adb_port=persistent_adb_port,
+        boot_adb_port=boot_adb_port,
     )

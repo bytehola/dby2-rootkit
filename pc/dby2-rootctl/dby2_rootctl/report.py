@@ -75,10 +75,10 @@ def build_report(
     ]
 
     warnings: list[str] = []
-    if snapshot.persistent_adb_port:
+    if snapshot.boot_adb_port:
         warnings.append(
-            "Persistent TCP ADB is configured on this device "
-            f"(port {snapshot.persistent_adb_port})."
+            "TCP ADB is configured for the current boot "
+            f"(port {snapshot.boot_adb_port})."
         )
     if snapshot.root_available and not vector_available:
         warnings.append("Root is active, but the Xposed runtime is degraded.")

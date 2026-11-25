@@ -57,7 +57,7 @@ class RootProbeTests(unittest.TestCase):
                         "boot_id=boot-test\n"
                         "selinux_mode=Enforcing\n"
                         "shell_identity=uid=2000(shell)\n"
-                        "persistent_adb_port=5555\n"
+                        "boot_adb_port=5555\n"
                         "system_server_pid=123\n"
                         "surfaceflinger_pid=456\n"
                     ),

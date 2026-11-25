@@ -12,7 +12,7 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 revision="$(git rev-parse --short=12 HEAD)"
-version="${RELEASE_VERSION:-2.0}"
+version="${RELEASE_VERSION:-2.1}"
 archive_name="DBY2-RootKit-${version}-source.tar.gz"
 archive_path="${DIST_DIR}/${archive_name}"
 checksum_path="${archive_path}.sha256"

@@ -3,7 +3,7 @@
 <p align="center">面向 HUAWEI MatePad Air 11.5 2023（DBY2-W00）的临时 Root、Magisk 与 Xposed 一体化工具。</p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.0-3776AB?style=flat-square" alt="Version 2.0">
+  <img src="https://img.shields.io/badge/version-2.1-3776AB?style=flat-square" alt="Version 2.1">
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square" alt="Python 3.10 or later">
   <img src="https://img.shields.io/badge/Android-12%20%2F%20API%2031-4B5563?style=flat-square" alt="Android 12 API 31">
   <img src="https://img.shields.io/badge/License-GPL--3.0--or--later-22C55E?style=flat-square" alt="GNU GPL version 3 or later">
@@ -68,7 +68,7 @@ dby2-rootkit-gui
 构建 Windows 发行包还需要 `WINDOWS_PYTHON`、`PLATFORM_TOOLS_DIRECTORY` 和 `wslpath`：
 
 ```bash
-RELEASE_VERSION=2.0 \
+RELEASE_VERSION=2.1 \
 OUTPUT_DIRECTORY=dist/user-release \
 ./scripts/build-user-release.sh
 ```
@@ -76,7 +76,7 @@ OUTPUT_DIRECTORY=dist/user-release \
 构建源码包：
 
 ```bash
-RELEASE_VERSION=2.0 ./scripts/build-source-release.sh
+RELEASE_VERSION=2.1 ./scripts/build-source-release.sh
 ```
 
 > Root Engine 和 DirtyFrag 会触发内核路径，失败可能导致 oops、panic 或设备重启。

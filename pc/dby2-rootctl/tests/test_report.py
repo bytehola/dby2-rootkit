@@ -27,7 +27,7 @@ def build_snapshot() -> DeviceSnapshot:
         vector_error="",
         system_server_pid="100",
         surfaceflinger_pid="200",
-        persistent_adb_port="5555",
+        boot_adb_port="5555",
     )
 
 
@@ -35,7 +35,7 @@ class ReportTests(unittest.TestCase):
     def setUp(self) -> None:
         self.profile = load_profile(DEFAULT_PROFILE_DIRECTORY)
 
-    def test_active_root_and_xposed_produce_warning_for_persistent_adb(self) -> None:
+    def test_active_root_and_xposed_produce_warning_for_boot_adb(self) -> None:
         snapshot = build_snapshot()
         evaluation = evaluate_identity(self.profile, snapshot.identity())
 
@@ -44,7 +44,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report["state"], "root-active")
         self.assertTrue(report["profile"]["succeeded"])
         self.assertTrue(
-            any("Persistent TCP ADB" in warning for warning in report["warnings"])
+            any("TCP ADB is configured" in warning for warning in report["warnings"])
         )
 
     def test_wrong_build_is_reported_as_unsupported(self) -> None:

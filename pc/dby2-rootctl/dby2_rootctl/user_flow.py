@@ -30,6 +30,20 @@ class UserFlowError(RuntimeError):
     pass
 
 
+ONE_TAP_ROOT_SERVICE = (
+    "com.topjohnwu.magisk/.core.root.OneTapRootService"
+)
+SERVICE_START_TIMEOUT_SECONDS = 20.0
+SERVICE_COMPLETE_TIMEOUT_SECONDS = 150.0
+RUNTIME_READY_TIMEOUT_SECONDS = 30.0
+LOCAL_ADB_PORT = "5555"
+TIMEOUT_CLEANUP_PACKAGES = (
+    "com.topjohnwu.magisk",
+    "org.matrix.vector.manager",
+    "dev.dby2.rootkit",
+)
+
+
 class DeviceAccessError(UserFlowError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -162,65 +176,32 @@ class UserFlow:
         )
 
         self._install_magisk(connection.client)
-        if not connection.snapshot.root_available:
-            connection = self._acquire_root_over_adb(connection)
-
-        magisk_installed = self._package_installed(
-            connection.client,
-            "com.topjohnwu.magisk",
-        )
-        runtime_modules_installed = self._runtime_modules_installed(
-            connection.client
-        )
+        connection = self._run_one_tap_installation(connection)
         rootkit_installed = self._package_installed(
             connection.client,
             "dev.dby2.rootkit",
         )
-        if magisk_installed and runtime_modules_installed:
-            if not rootkit_installed:
-                self._install_rootkit(connection.client)
-            self._log("检测到已安装 Magisk，恢复本次启动的 Root 环境...")
-            result = self._run_command(
-                self._common_arguments(connection)
-                + [
-                    "resume",
-                    "--require-existing-root",
-                    "--magisk-apk",
-                    str(self.layout.magisk_apk.path),
-                    "--magisk-sha256",
-                    self.layout.magisk_apk.sha256,
-                    "--yes",
-                ]
-            )
-        else:
-            self._log("执行首次安装：Magisk、RootKit、NyaZygisk、Vector...")
-            result = self._run_command(
-                self._common_arguments(connection)
-                + [
-                    "bootstrap",
-                    "--require-existing-root",
-                    "--magisk-apk",
-                    str(self.layout.magisk_apk.path),
-                    "--magisk-sha256",
-                    self.layout.magisk_apk.sha256,
-                    "--rootkit-apk",
-                    str(self.layout.rootkit_apk.path),
-                    "--rootkit-sha256",
-                    self.layout.rootkit_apk.sha256,
-                    "--nyazygisk-zip",
-                    str(self.layout.nyazygisk_zip.path),
-                    "--nyazygisk-sha256",
-                    self.layout.nyazygisk_zip.sha256,
-                    "--vector-zip",
-                    str(self.layout.vector_zip.path),
-                    "--vector-sha256",
-                    self.layout.vector_zip.sha256,
-                    "--replace-modules",
-                    "--yes",
-                ]
+        if not rootkit_installed:
+            self._install_rootkit(connection.client)
+
+        self._log("执行 Root、Zygisk 和 Vector 完整验证...")
+        result = self._run_command(
+            self._common_arguments(connection)
+            + ["verify", "--require-xposed"],
+            accepted_exit_codes=frozenset({9}),
+            log_output=False,
+        )
+        if result.get("ok") is not True:
+            failed_checks = result.get("failed_checks", [])
+            detail = ", ".join(str(check) for check in failed_checks)
+            raise UserFlowError(
+                "完整验证未通过"
+                + (f"：{detail}" if detail else "")
             )
 
+        self._persist_adb_tcp_port(connection.client)
         self._launch_rootkit(connection.client)
+        self._log("完整验证通过。")
         self._log(
             "Root 环境已启动。请在平板弹窗中点击“允许”，"
             "然后点击“验证状态”。"
@@ -276,12 +257,19 @@ class UserFlow:
         if completion_callback is not None:
             completion_callback(False, message)
 
-    def _acquire_root_over_adb(
+    def _run_one_tap_installation(
         self,
         connection: DeviceConnection,
     ) -> DeviceConnection:
         client = connection.client
-        if connection.snapshot.persistent_adb_port != "5555":
+        current_port_result = client.shell(
+            "getprop service.adb.tcp.port",
+            timeout_seconds=8.0,
+        )
+        if (
+            not current_port_result.succeeded
+            or current_port_result.stdout.strip() != "5555"
+        ):
             self._log("启用本机 ADB Root 通道...")
             tcpip_result = client.run(["tcpip", "5555"], timeout_seconds=45.0)
             if not tcpip_result.succeeded:
@@ -304,58 +292,140 @@ class UserFlow:
             raise UserFlowError(f"Magisk Root 服务启动失败：{detail}")
 
         self._log(
-            "Magisk 正在后台执行 ADB Root；首次使用请在平板允许"
-            " Magisk 的本机 ADB 调试请求..."
+            "Magisk 正在后台执行完整 Root、模块安装与 Vector 激活；"
+            "首次使用请在平板允许 Magisk 的本机 ADB 调试请求..."
         )
-        deadline = time.monotonic() + 300.0
-        next_status_log = 0.0
-        identity = ""
-        while time.monotonic() < deadline:
-            probe_result = client.shell(
-                "/data/local/tmp/dfroot-su -c id",
-                timeout_seconds=8.0,
+        self._wait_for_one_tap_root_service(client)
+        return self._wait_for_ready_runtime(connection)
+
+    def _persist_adb_tcp_port(self, client: AdbClient) -> None:
+        self._log("配置后续启动的本机 ADB Root 通道...")
+        set_command = (
+            f"/data/local/tmp/dfroot-su -c "
+            f"'setprop persist.adb.tcp.port {LOCAL_ADB_PORT}'"
+        )
+        set_result = client.shell(set_command, timeout_seconds=15.0)
+        if not set_result.succeeded:
+            fallback_command = (
+                f"/system/bin/su -c "
+                f"'setprop persist.adb.tcp.port {LOCAL_ADB_PORT}'"
             )
-            identity = probe_result.stdout.strip()
-            if "uid=0(root)" in identity:
-                self._log("Magisk 后台 Root 已完成。")
+            set_result = client.shell(
+                fallback_command,
+                timeout_seconds=15.0,
+            )
+        if not set_result.succeeded:
+            detail = set_result.stderr.strip() or set_result.stdout.strip()
+            raise UserFlowError(f"持久化本机 ADB 端口失败：{detail}")
+
+        verify_result = client.shell(
+            "getprop persist.adb.tcp.port",
+            timeout_seconds=8.0,
+        )
+        actual_port = verify_result.stdout.strip()
+        if not verify_result.succeeded or actual_port != LOCAL_ADB_PORT:
+            raise UserFlowError(
+                "持久化本机 ADB 端口校验失败："
+                f"expected={LOCAL_ADB_PORT}, actual={actual_port}"
+            )
+
+    def _wait_for_one_tap_root_service(self, client: AdbClient) -> None:
+        start_deadline = (
+            time.monotonic() + SERVICE_START_TIMEOUT_SECONDS
+        )
+        service_started = False
+        while time.monotonic() < start_deadline:
+            service_state = self._one_tap_service_state(client)
+            if service_state is True:
+                service_started = True
                 break
+            time.sleep(0.5)
+
+        if not service_started:
+            raise UserFlowError(
+                "Magisk 后台服务未能启动。"
+                "请确认平板已允许 Magisk 的本机 ADB 调试请求。"
+            )
+
+        complete_deadline = (
+            time.monotonic() + SERVICE_COMPLETE_TIMEOUT_SECONDS
+        )
+        next_status_log = time.monotonic() + 15.0
+        while time.monotonic() < complete_deadline:
+            service_state = self._one_tap_service_state(client)
+            if service_state is False:
+                self._log("Magisk 后台安装与 Vector 激活已完成。")
+                return
 
             current_time = time.monotonic()
             if current_time >= next_status_log:
-                self._log("等待 Magisk 后台 Root 完成...")
+                self._log("等待 Magisk 完成组件安装与 Vector 激活...")
                 next_status_log = current_time + 15.0
-            time.sleep(2.0)
-        else:
-            raise UserFlowError(
-                "等待 Magisk 后台 Root 超时。"
-                "首次使用时请在平板允许 Magisk 的本机 ADB 调试请求。"
+            time.sleep(1.0)
+
+        self._log("等待超过 150 秒，正在卸载 Magisk、Vector 和 DBY2 RootKit...")
+        for package_name in TIMEOUT_CLEANUP_PACKAGES:
+            client.shell(
+                f"pm uninstall --user 0 {package_name}",
+                timeout_seconds=45.0,
             )
 
-        refreshed_snapshot: DeviceSnapshot | None = None
-        for attempt_index in range(15):
-            refreshed_snapshot = collect_snapshot(client)
-            if refreshed_snapshot.root_available and refreshed_snapshot.kernel:
+        self._log("正在通过 ADB 重启平板...")
+        client.shell("reboot", timeout_seconds=15.0)
+        raise UserFlowError(
+            "等待 Magisk 后台安装与 Vector 激活超过 150 秒。"
+            "已卸载 Magisk、Vector 和 DBY2 RootKit，"
+            "并执行 adb shell reboot。"
+            "请在平板重启完成后重新点击“一键 Root”。"
+        )
+
+    def _wait_for_ready_runtime(
+        self,
+        connection: DeviceConnection,
+    ) -> DeviceConnection:
+        deadline = (
+            time.monotonic() + RUNTIME_READY_TIMEOUT_SECONDS
+        )
+        latest_snapshot: DeviceSnapshot | None = None
+        while time.monotonic() < deadline:
+            latest_snapshot = collect_snapshot(connection.client)
+            vector_ready = bool(
+                latest_snapshot.vector_status
+                and latest_snapshot.vector_status.get("success") is True
+            )
+            if (
+                latest_snapshot.root_available
+                and latest_snapshot.magisk_version
+                and latest_snapshot.zygisk_status == "injected"
+                and vector_ready
+            ):
                 return DeviceConnection(
-                    client=client,
-                    snapshot=refreshed_snapshot,
+                    client=connection.client,
+                    snapshot=latest_snapshot,
                     profile=connection.profile,
                     evaluation=connection.evaluation,
                 )
-            if attempt_index < 14:
-                self._log("Root 已返回，正在等待 ADB 和系统状态同步...")
-                time.sleep(1.0)
+            time.sleep(1.0)
 
-        assert refreshed_snapshot is not None
-        if not refreshed_snapshot.kernel:
-            raise UserFlowError(
-                "Root 已返回，但 ADB Shell 尚未恢复。"
-                "这通常是 Magisk 切换系统挂载时的瞬时状态，"
-                "请保持 USB 连接后重试。"
-            )
+        if latest_snapshot is None:
+            raise UserFlowError("Magisk 后台服务已退出，但无法读取运行状态。")
         raise UserFlowError(
-            "ADB Root 命令已返回，但重新检测仍未取得 UID 0。"
-            f"当前身份：{refreshed_snapshot.root_identity or identity}"
+            "Magisk 后台服务已退出，但运行环境未就绪："
+            f"root={latest_snapshot.root_available}, "
+            f"magisk={latest_snapshot.magisk_version or 'unavailable'}, "
+            f"zygisk={latest_snapshot.zygisk_status}, "
+            f"vector={latest_snapshot.vector_error or 'unavailable'}"
         )
+
+    @staticmethod
+    def _one_tap_service_state(client: AdbClient) -> bool | None:
+        result = client.shell(
+            "dumpsys activity services com.topjohnwu.magisk",
+            timeout_seconds=10.0,
+        )
+        if not result.succeeded:
+            return None
+        return ONE_TAP_ROOT_SERVICE in result.stdout
 
     def _install_magisk(self, client: AdbClient) -> None:
         self._log("安装或更新发行包内的移植 Magisk...")
@@ -472,15 +542,6 @@ class UserFlow:
             package_result.succeeded
             and "package:" in package_result.stdout
         )
-
-    @staticmethod
-    def _runtime_modules_installed(client: AdbClient) -> bool:
-        module_result = client.shell(
-            "test -d /data/adb/modules/zygisksu "
-            "&& test -d /data/adb/modules/zygisk_vector",
-            timeout_seconds=10.0,
-        )
-        return module_result.succeeded
 
     def _launch_rootkit(self, client: AdbClient) -> None:
         client.shell(
