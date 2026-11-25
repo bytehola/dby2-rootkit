@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>DBY2 RootKit</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">D</div>
+        <div>
+          <div class="brand-name">DBY2 RootKit</div>
+          <div class="brand-subtitle">MatePad Air 11.5 · HarmonyOS 4.2</div>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <div id="connectionPill" class="connection-pill is-checking">
+          <span class="status-dot"></span>
+          <span id="connectionPillText">正在检测设备</span>
+        </div>
+        <button id="helpButton" class="button button-quiet" type="button">
+          连接说明
+        </button>
+      </div>
+    </header>
+
+    <main class="main-content">
+      <section id="connectionBanner" class="connection-banner hidden" aria-live="polite">
+        <div class="banner-icon" aria-hidden="true">!</div>
+        <div class="banner-copy">
+          <strong id="connectionBannerTitle">尚未连接平板</strong>
+          <span id="connectionBannerText">
+            连接数据线并开启 USB 调试。
+          </span>
+        </div>
+        <div class="banner-actions">
+          <button id="bannerGuideButton" class="button button-light" type="button">
+            图文步骤
+          </button>
+          <button id="bannerRetryButton" class="button button-light" type="button">
+            重新检测
+          </button>
+        </div>
+      </section>
+
+      <section class="hero-grid">
+        <article class="action-panel">
+          <div class="eyebrow">设备操作</div>
+          <h1 id="actionTitle">等待设备连接</h1>
+          <p id="actionDescription">
+            连接后自动通过 USB ADB 获取 Root。
+          </p>
+
+          <div class="primary-actions">
+            <button id="rootButton" class="button button-primary" type="button" disabled>
+              <span id="rootButtonLabel">一键 Root</span>
+              <span class="button-arrow" aria-hidden="true">→</span>
+            </button>
+            <button id="verifyButton" class="button button-secondary" type="button" disabled>
+              验证
+            </button>
+          </div>
+
+          <div id="progressPanel" class="progress-panel hidden" aria-live="polite">
+            <div class="progress-track"><div class="progress-bar"></div></div>
+            <div id="progressText" class="progress-text">正在准备</div>
+          </div>
+
+          <div class="action-footer">
+            <span>DBY2-W00</span>
+            <span>临时 Root</span>
+          </div>
+        </article>
+
+        <article class="status-panel">
+          <div class="panel-heading">
+            <div>
+              <div class="eyebrow">状态</div>
+              <h2>运行环境</h2>
+            </div>
+            <button id="refreshButton" class="icon-button" type="button" aria-label="刷新状态">
+              ↻
+            </button>
+          </div>
+
+          <div class="status-list">
+            <div class="status-row">
+              <span class="status-label">设备</span>
+              <span id="deviceStatus" class="status-value muted">等待连接</span>
+            </div>
+            <div class="status-row">
+              <span class="status-label">系统版本</span>
+              <span id="buildStatus" class="status-value muted">尚未读取</span>
+            </div>
+            <div class="status-row">
+              <span class="status-label">Root</span>
+              <span id="rootStatus" class="status-value muted">未检查</span>
+            </div>
+            <div class="status-row">
+              <span class="status-label">Magisk</span>
+              <span id="magiskStatus" class="status-value muted">未检查</span>
+            </div>
+            <div class="status-row">
+              <span class="status-label">Zygisk</span>
+              <span id="zygiskStatus" class="status-value muted">未检查</span>
+            </div>
+            <div class="status-row">
+              <span class="status-label">Vector</span>
+              <span id="vectorStatus" class="status-value muted">未检查</span>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="console-panel">
+        <div class="console-heading">
+          <div>
+            <div class="eyebrow">日志</div>
+            <h2>执行记录</h2>
+          </div>
+          <div class="console-actions">
+            <span id="runSummary" class="run-summary">准备就绪</span>
+            <button id="copyLogsButton" class="button button-quiet button-small" type="button">
+              复制
+            </button>
+            <button id="clearLogButton" class="button button-quiet button-small" type="button">
+              清空
+            </button>
+            <button id="diagnosticsButton" class="button button-quiet button-small" type="button">
+              诊断
+            </button>
+          </div>
+        </div>
+        <div id="logView" class="log-view" role="log" aria-live="polite">
+          <div class="log-empty">等待操作</div>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <span>HarmonyOS 4.2.0.252 · 临时 Root</span>
+      </footer>
+    </main>
+  </div>
+
+  <div id="guideModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="guideTitle">
+    <div class="modal-backdrop" data-close-guide></div>
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <div class="eyebrow">HarmonyOS 4.2</div>
+          <h2 id="guideTitle">请先连接并授权平板</h2>
+        </div>
+        <button class="modal-close" type="button" aria-label="关闭" data-close-guide>×</button>
+      </div>
+
+      <p id="guideMessage" class="guide-message">
+        开启 USB 调试后重新检测。
+      </p>
+
+      <div class="guide-steps">
+        <article class="guide-step">
+          <div class="step-number">1</div>
+          <div class="step-copy">
+            <h3>打开“关于手机”</h3>
+            <p>设置 → 关于手机。</p>
+          </div>
+          <img src="guide/harmonyos42/01-about-phone.png" alt="HarmonyOS 4.2 设置中的关于手机入口">
+        </article>
+
+        <article class="guide-step">
+          <div class="step-number">2</div>
+          <div class="step-copy">
+            <h3>进入“系统和更新”</h3>
+            <p>返回设置 → 系统和更新。</p>
+          </div>
+          <img src="guide/harmonyos42/02-system-updates.png" alt="HarmonyOS 4.2 设置中的系统和更新入口">
+        </article>
+
+        <article class="guide-step">
+          <div class="step-number">3</div>
+          <div class="step-copy">
+            <h3>开启“开发人员选项”</h3>
+            <p>不存在时先连续点击“HarmonyOS 版本”7 次。</p>
+          </div>
+          <img src="guide/harmonyos42/03-developer-options.png" alt="HarmonyOS 4.2 开发人员选项总开关">
+        </article>
+
+        <article class="guide-step">
+          <div class="step-number">4</div>
+          <div class="step-copy">
+            <h3>打开 USB 调试</h3>
+            <p>同时打开“仅充电模式下允许 ADB 调试”。</p>
+          </div>
+          <img src="guide/harmonyos42/04-usb-debugging.png" alt="HarmonyOS 4.2 USB 调试开关">
+        </article>
+      </div>
+
+      <div class="guide-note">
+        USB 连接方式选择“传输文件”。如果仍未弹授权，撤销 USB 调试授权后
+        重新插拔数据线。
+      </div>
+
+      <div class="guide-source">
+        图片来源：VMOS+ Documentation · HarmonyOS 4.2
+      </div>
+
+      <div class="modal-actions">
+        <button id="guideRetryButton" class="button button-primary" type="button">
+          重新检测
+        </button>
+        <button class="button button-secondary" type="button" data-close-guide>
+          关闭
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="rebootModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="rebootTitle">
+    <div class="modal-backdrop" data-close-reboot></div>
+    <div class="modal-card reboot-modal-card">
+      <div class="modal-header">
+        <div>
+          <div class="eyebrow">软重启</div>
+          <h2 id="rebootTitle">Root 环境已启动</h2>
+        </div>
+        <button class="modal-close" type="button" aria-label="关闭" data-close-reboot>×</button>
+      </div>
+
+      <div class="reboot-notice">
+        <strong id="rebootCountdown">10 秒后软重启</strong>
+        <p id="rebootMessage">
+          请在平板弹窗中点击“允许”。系统框架重启时屏幕会短暂黑屏。
+        </p>
+      </div>
+
+      <div class="modal-actions">
+        <button id="rebootCloseButton" class="button button-secondary" type="button">
+          关闭
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>

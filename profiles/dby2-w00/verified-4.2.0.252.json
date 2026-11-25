@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "profile_id": "dby2-w00-4.2.0.252",
+  "display_name": "DBY2-W00 HarmonyOS 4.2.0.252",
+  "device": {
+    "model": "DBY2-W00",
+    "android_release": "12",
+    "sdk": 31,
+    "abi": "arm64-v8a",
+    "kernel_prefix": "5.4.86",
+    "display_id": "DBY2-W00 4.2.0.252(C00E100R3P5)",
+    "incremental": "104.2.0.252C00"
+  },
+  "runtime": {
+    "broker_version": 1,
+    "magisk_version_prefix": "31.1",
+    "vector_api": 102,
+    "shell_uid": 2000
+  },
+  "policy": {
+    "allow_system_xposed": true,
+    "allow_standalone_root": false,
+    "allow_persistent_adb": false,
+    "root_policy_scope": "boot"
+  }
+}

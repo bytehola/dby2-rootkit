@@ -1,0 +1,220 @@
+name: CI
+run-name: >-
+  ${{
+    github.event_name == 'push'
+    && github.event.head_commit.message
+    || format('CI #{0} - {1}', github.run_number, github.actor)
+  }}
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    tags: [ v* ]
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ====================================================================
+      # 1. SETUP ENVIRONMENT
+      # ====================================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+          fetch-depth: 0 # Needed for versioning from git history
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: "zulu"
+          java-version: "21"
+          cache: "gradle"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4.0.1
+        with:
+          cmdline-tools-version: 14742923
+          packages: ''
+
+      - name: Accept licenses
+        run: yes | sdkmanager --licenses
+
+      - name: Install SDK 37 & NDK
+        run: |
+          sdkmanager "platforms;android-37.0"
+          sdkmanager "build-tools;37.0.0"
+          sdkmanager "ndk;27.2.12479018"
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup override set nightly
+          rustup component add rust-src
+          rustup target add aarch64-linux-android
+          rustup target add x86_64-linux-android
+          rustup target add armv7-linux-androideabi
+
+      - name: Install cargo-ndk
+        # The zygiskd build invokes `cargo ndk` to cross-compile the daemon.
+        # Intentionally unpinned: the build uses the `--platform` flag, which is
+        # stable across cargo-ndk releases. Prebuilt binary avoids a source build.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Setup Ccache for faster builds
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ${{ github.job }}-${{ runner.os }}-${{ hashFiles('**/build.gradle.kts') }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: zygiskd -> build/rust/target
+
+      # ====================================================================
+      # 2. CONFIGURE AND BUILD
+      # ====================================================================
+      - name: Build with Gradle
+        run: ./gradlew zipRelease zipDebug -Porg.gradle.parallel=true -Porg.gradle.vfs.watch=true -Dorg.gradle.jvmargs=-Xmx2048m
+
+      # ====================================================================
+      # 3. PREPARE AND UPLOAD ARTIFACTS
+      # ====================================================================
+      - name: Prepare build artifacts
+        if: success()
+        id: prepare_artifacts
+        run: |
+          RELEASE_ZIP=$(find module/build/outputs/release -type f -name 'NyaZygisk-v*-release.zip')
+          DEBUG_ZIP=$(find module/build/outputs/release -type f -name 'NyaZygisk-v*-debug.zip')
+
+          RELEASE_NAME=$(basename "$RELEASE_ZIP" .zip)
+          DEBUG_NAME=$(basename "$DEBUG_ZIP" .zip)
+
+          echo "RELEASE_ZIP=${RELEASE_ZIP}" >> $GITHUB_OUTPUT
+          echo "DEBUG_ZIP=${DEBUG_ZIP}" >> $GITHUB_OUTPUT
+          echo "RELEASE_NAME=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+          echo "DEBUG_NAME=${DEBUG_NAME}" >> $GITHUB_OUTPUT
+
+          unzip "$RELEASE_ZIP" -d "release-artifact"
+          unzip "$DEBUG_ZIP" -d "debug-artifact"
+
+      - name: Upload Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare_artifacts.outputs.RELEASE_NAME }}
+          path: release-artifact/
+
+      - name: Upload Debug Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare_artifacts.outputs.DEBUG_NAME }}
+          path: debug-artifact/
+
+      - name: Upload Release Symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-symbols
+          path: zygiskd/build/symbols/release/
+
+      - name: Upload Debug Symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-symbols
+          path: zygiskd/build/symbols/debug/
+
+      - name: Publish artifacts to Telegram
+        if: success() && github.event_name != 'pull_request'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_THREAD_ID: ${{ secrets.TG_THREAD_ID }}
+          RELEASE_ZIP: ${{ steps.prepare_artifacts.outputs.RELEASE_ZIP }}
+          TITLE: NyaZygisk
+          VERSION: ${{ github.run_number }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "::warning::Telegram secrets not configured, skipping upload"
+            exit 0
+          fi
+
+          if [ ! -f "$RELEASE_ZIP" ]; then
+            echo "::error::Release ZIP not found: $RELEASE_ZIP"
+            exit 1
+          fi
+
+          COMMIT_MESSAGE=$(git log -1 --pretty=%B 2>/dev/null || echo "No commit message")
+          PRIMARY_AUTHOR=$(git log -1 --pretty=%an 2>/dev/null || echo "Unknown")
+
+          # HTML 特殊字元跳脫
+          escape_html() {
+            sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+          }
+          trim_caption_message() {
+            local text="$1"
+            local limit="$2"
+
+            if [ "$limit" -le 0 ]; then
+              printf ''
+              return
+            fi
+
+            if [ "${#text}" -le "$limit" ]; then
+              printf '%s' "$text"
+              return
+            fi
+
+            if [ "$limit" -le 3 ]; then
+              printf '%.*s' "$limit" '...'
+              return
+            fi
+
+            printf '%s...' "${text:0:$((limit - 3))}"
+          }
+          SAFE_TITLE=$(printf '%s' "$TITLE" | escape_html)
+          SAFE_BRANCH=$(printf '%s' "$BRANCH" | escape_html)
+          SAFE_PRIMARY_AUTHOR=$(printf '%s' "$PRIMARY_AUTHOR" | escape_html)
+          SAFE_MESSAGE=$(printf '%s' "$COMMIT_MESSAGE" | sed -e 's/\r//g' | escape_html)
+
+          NL=$'\n'
+          CAPTION_PREFIX="<b>${SAFE_TITLE}</b>${NL}"
+          CAPTION_PREFIX+="Author: ${SAFE_PRIMARY_AUTHOR}${NL}"
+          CAPTION_PREFIX+="Branch: ${SAFE_BRANCH}${NL}"
+          CAPTION_PREFIX+="Run: #ci_${VERSION}${NL}${NL}"
+          CAPTION_SUFFIX="${NL}${NL}<a href=\"${COMMIT_URL}\">Commit</a>${NL}"
+          CAPTION_SUFFIX+="<a href=\"${RUN_URL}\">Workflow run</a>"
+          MAX_CAPTION_LENGTH=1024
+          MESSAGE_WRAPPER_LENGTH=24
+          AVAILABLE_MESSAGE_LENGTH=$((MAX_CAPTION_LENGTH - ${#CAPTION_PREFIX} - ${#CAPTION_SUFFIX} - MESSAGE_WRAPPER_LENGTH))
+          SAFE_MESSAGE=$(trim_caption_message "$SAFE_MESSAGE" "$AVAILABLE_MESSAGE_LENGTH")
+          CAPTION="${CAPTION_PREFIX}<blockquote>${SAFE_MESSAGE}</blockquote>${CAPTION_SUFFIX}"
+
+          CURL_ARGS=(
+            --silent --show-error --fail
+            --request POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument"
+            --form "chat_id=${TG_CHAT_ID}"
+            --form "document=@${RELEASE_ZIP}"
+            --form "parse_mode=HTML"
+            --form-string "caption=${CAPTION}"
+          )
+
+          if [ -n "${TG_THREAD_ID:-}" ]; then
+            CURL_ARGS+=(--form "message_thread_id=${TG_THREAD_ID}")
+          fi
+
+          echo "Uploading $(basename "$RELEASE_ZIP") to Telegram..."
+          curl "${CURL_ARGS[@]}" >/dev/null
+          echo "Upload completed."

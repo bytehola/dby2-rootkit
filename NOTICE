@@ -1,0 +1,23 @@
+DBY2 RootKit
+
+Copyright (C) 2026 DBY2 RootKit contributors
+
+Original source code in this repository is licensed under the GNU General
+Public License, version 3 or later, unless a file states otherwise.
+
+Vendored components keep their original licenses and copyright notices:
+
+- Magisk: GPL-3.0-or-later.
+- NyaZygisk: GPL-3.0.
+- Vector: GPL-3.0.
+- DBY2 Root Engine: GPL-3.0-or-later.
+- DBY2 DirtyFrag local adaptation: GPL-3.0-or-later.
+- mitschud/DirtyFrag reference: GPL-2.0-only.
+- V4bel/dirtyfrag reference: no license file was found in the imported source.
+
+The V4bel source is recorded for provenance but is not relicensed by this
+repository. Downstream distributors must independently verify whether their
+distribution complies with all applicable upstream terms.
+
+No Huawei firmware, OTA package, system image, private signing key, private ADB
+key, or user device identifier is included in this repository.

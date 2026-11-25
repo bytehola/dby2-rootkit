@@ -1,0 +1,1584 @@
+// src/zygiskd.rs
+
+//! The core logic for the Zygisk daemon (`zygiskd`).
+//!
+//! This module is responsible for:
+//! - Initializing paths and communication channels.
+//! - Loading Zygisk modules from the designated directory.
+//! - Listening on a Unix domain socket for requests from the Zygisk injector.
+//! - Handling requests such as providing module libraries, querying process flags,
+//!   and managing companion processes.
+
+use crate::constants::{self, DaemonSocketAction, ProcessFlags, ZKSU_VERSION};
+use crate::exclude;
+use crate::mount::{MountNamespace, MountNamespaceManager};
+use crate::utils::{self, UnixStreamExt};
+use crate::{lp_select, root_impl};
+use anyhow::{Context as AnyhowContext, Result, bail};
+use log::{debug, error, info, trace, warn};
+use serde_json;
+use passfd::FdPassingExt;
+use std::collections::HashMap;
+use std::fs;
+use std::io::Error;
+use std::mem::size_of;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::process::CommandExt;
+use std::{
+    os::unix::net::{UnixListener, UnixStream},
+    path::{Path, PathBuf},
+    process::{Child, Command},
+    sync::{
+        atomic::{fence, Ordering},
+        mpsc, Arc, Mutex, OnceLock, RwLock,
+    },
+    thread,
+    time::Duration,
+};
+
+const AID_SYSTEM: u32 = 1000;
+const WORKER_POOL_SIZE: usize = 16;
+const WORKER_QUEUE_CAPACITY: usize = 128;
+const IPC_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const COMPANION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Represents a loaded Zygisk module.
+struct Module {
+    name: String,
+    lib_fd: OwnedFd,
+    /// A handle to the module's companion process socket, if it exists and is running.
+    companion: Mutex<Option<UnixStream>>,
+}
+
+/// The shared context for the daemon, containing all loaded modules and a mount namespace manager
+struct AppContext {
+    /// The live module snapshot, replaced wholesale by `RefreshModules`.
+    ///
+    /// Under a temp root the daemon outlives module promotions, hot installs and whole
+    /// root sessions, so the set it serves has to be replaceable. Handing each request an
+    /// `Arc` of the snapshot keeps in-flight work on the set it started with, and retiring
+    /// a snapshot drops its companions with it.
+    modules: RwLock<Arc<Vec<Module>>>,
+    mount_manager: Arc<MountNamespaceManager>,
+    zn_companions: Mutex<HashMap<PathBuf, Arc<Mutex<Option<UnixStream>>>>>,
+    /// Write ends of cancellation pipes for active `hyos_spawner` SOCK_DGRAM companion
+    /// broker threads, keyed by canonical module path. Replacing an entry drops the old
+    /// pipe write end, waking the old thread's `poll()` so it exits cleanly.
+    zn_brokers: Mutex<HashMap<PathBuf, OwnedFd>>,
+    zn_states: Mutex<HashMap<PathBuf, (u32, u32)>>,
+    /// Companions spawned and not yet waited for. A companion is a child of a daemon
+    /// that never exits, so one that exits stays a zombie until `reap_companions` runs.
+    pending_companions: Mutex<Vec<Child>>,
+}
+
+impl AppContext {
+    /// Takes a reference to the current snapshot. Held only long enough to clone the
+    /// `Arc`, so a refresh is never blocked by a slow reader.
+    fn modules(&self) -> Arc<Vec<Module>> {
+        Arc::clone(&self.modules.read().unwrap())
+    }
+
+    fn reap_companions(&self) {
+        self.pending_companions
+            .lock()
+            .unwrap()
+            .retain_mut(|child| match child.try_wait() {
+                Ok(None) => true,
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        warn!("Companion {} exited: {}", child.id(), status);
+                    }
+                    false
+                }
+                Err(e) => {
+                    warn!("Cannot wait for companion {}: {}", child.id(), e);
+                    false
+                }
+            });
+    }
+
+    /// Rescans the module directory and publishes the result.
+    ///
+    /// The new snapshot is built completely before anything is published, so a scan that
+    /// fails leaves the daemon serving the previous set rather than an empty or partial
+    /// one. Returns the number of modules now live.
+    fn refresh_modules(&self) -> Result<usize> {
+        let modules = load_modules().context("Failed to rescan the module directory")?;
+        let count = modules.len();
+        let names: Vec<_> = modules.iter().map(|m| m.name.clone()).collect();
+        // The status readout is written from what the daemon reports, so a refreshed set
+        // has to be reported again or the module list the user sees keeps naming the one
+        // the daemon served at startup.
+        if let Err(e) = send_startup_info(&modules) {
+            warn!("Failed to report the refreshed module list: {:?}", e);
+        }
+        // The previous snapshot is dropped once the last in-flight reader releases it,
+        // which closes its library memfds and its companion sockets. A companion whose
+        // socket is closed has no remaining caller, so it exits on its own.
+        *self.modules.write().unwrap() = Arc::new(modules);
+        self.zn_companions.lock().unwrap().clear();
+        self.reap_companions();
+        info!("Module snapshot refreshed: {} module(s) {:?}", count, names);
+        Ok(count)
+    }
+}
+
+// Global paths, initialized once at startup.
+static TMP_PATH: OnceLock<String> = OnceLock::new();
+static SELF_EXE: OnceLock<PathBuf> = OnceLock::new();
+static DAEMON_LOCK: OnceLock<fs::File> = OnceLock::new();
+static CONTROLLER_SOCKET: OnceLock<String> = OnceLock::new();
+static DAEMON_SOCKET_PATH: OnceLock<String> = OnceLock::new();
+static SHARED_MEMORY: OnceLock<SharedShm> = OnceLock::new();
+
+struct SharedShm {
+    _rw_fd: OwnedFd,
+    ro_fd: OwnedFd,
+    layout: *mut constants::ShmLayout,
+    len: usize,
+    write_lock: Mutex<()>,
+}
+
+unsafe impl Send for SharedShm {}
+unsafe impl Sync for SharedShm {}
+
+impl SharedShm {
+    fn layout(&self) -> &constants::ShmLayout {
+        // The mapping outlives this object and every shared field is accessed atomically.
+        unsafe { &*self.layout }
+    }
+}
+
+impl Drop for SharedShm {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.layout as *mut _, self.len);
+        }
+    }
+}
+
+/// The main function for the zygiskd daemon.
+pub fn main(tmp_path: Option<&str>, self_exe: PathBuf) -> Result<()> {
+    info!("Welcome to NyaZygisk ({}) !", ZKSU_VERSION);
+
+    initialize_globals(tmp_path, self_exe)?;
+    // Lenient at startup where a refresh is strict: the daemon serves the heartbeat, the
+    // process flags and the mount namespaces too, and all of those are worth having even
+    // when the module set could not be read. A later `RefreshModules` can still pick it up.
+    let modules = load_modules().unwrap_or_else(|e| {
+        warn!("Starting with no modules: {:?}", e);
+        Vec::new()
+    });
+    if let Err(e) = send_startup_info(&modules) {
+        warn!("Failed to send startup info to controller: {:?}", e);
+    }
+
+    let mount_manager = Arc::new(MountNamespaceManager::new());
+    let context = Arc::new(AppContext {
+        modules: RwLock::new(Arc::new(modules)),
+        mount_manager,
+        zn_companions: Mutex::new(HashMap::new()),
+        zn_brokers: Mutex::new(HashMap::new()),
+        zn_states: Mutex::new(HashMap::new()),
+        pending_companions: Mutex::new(Vec::new()),
+    });
+    let listener = create_daemon_socket()?;
+    spawn_config_watcher();
+
+    // Bounded worker pool so a stalled client can never block accept() and bursts
+    // never exhaust thread limits or panic on thread::spawn.
+    let (tx, rx) = mpsc::sync_channel::<UnixStream>(WORKER_QUEUE_CAPACITY);
+    let rx = Arc::new(Mutex::new(rx));
+    for i in 0..WORKER_POOL_SIZE {
+        let worker_rx = Arc::clone(&rx);
+        let worker_ctx = Arc::clone(&context);
+        if let Err(e) = thread::Builder::new()
+            .name(format!("zygiskd-worker-{}", i))
+            .spawn(move || loop {
+                let stream = {
+                    let guard = worker_rx.lock().unwrap();
+                    match guard.recv() {
+                        Ok(s) => s,
+                        Err(_) => break,
+                    }
+                };
+                if let Err(e) = handle_connection(stream, &worker_ctx) {
+                    warn!("Error handling connection: {:?}", e);
+                }
+            })
+        {
+            warn!("Failed to spawn worker thread {}: {}", i, e);
+        }
+    }
+
+    info!("Daemon listening on {}", DAEMON_SOCKET_PATH.get().unwrap());
+
+    // Main event loop: accept and dispatch incoming connections to workers.
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                if let Err(e) = tx.try_send(stream) {
+                    warn!("Worker queue saturated, dropping incoming connection: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to accept incoming connection: {}", e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handles a single incoming connection from Zygisk on a worker thread.
+fn handle_connection(mut stream: UnixStream, context: &Arc<AppContext>) -> Result<()> {
+    let _ = stream.set_read_timeout(Some(IPC_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IPC_IO_TIMEOUT));
+
+    let action = stream.read_u8()?;
+    let action = DaemonSocketAction::try_from(action)
+        .with_context(|| format!("Invalid daemon action code: {}", action))?;
+    let peer = utils::peer_uid(&stream);
+    trace!("New daemon action: {:?} (peer_uid={:?})", action, peer);
+
+    match action {
+        DaemonSocketAction::CacheMountNamespace => {
+            let pid = stream.read_u32()? as i32;
+            // Only the zygote/root context legitimately calls this, for its own pid,
+            // before dropping privileges to the forked child's app uid, and a late-injected
+            // system_server (uid 1000) for itself. Reject anyone else so an
+            // already-specialized app can't poison another pid's cached mount namespace entry.
+            if !matches!(peer, Some(0) | Some(AID_SYSTEM)) {
+                warn!("CacheMountNamespace: rejecting request from untrusted peer {:?} for pid {}", peer, pid);
+            } else {
+                context
+                    .mount_manager
+                    .save_mount_namespace(pid, MountNamespace::Clean)?;
+                context
+                    .mount_manager
+                    .save_mount_namespace(pid, MountNamespace::Root)?;
+            }
+        }
+        DaemonSocketAction::PingHeartbeat => {
+            if !matches!(peer, Some(0) | Some(AID_SYSTEM)) {
+                warn!("PingHeartbeat: rejecting request from untrusted peer {:?}", peer);
+                return Ok(());
+            }
+            let value = constants::ZYGOTE_INJECTED;
+            utils::unix_datagram_sendto(CONTROLLER_SOCKET.get().unwrap(), &value.to_le_bytes())?;
+        }
+        DaemonSocketAction::ZygoteRestart => {
+            if peer != Some(0) {
+                warn!("ZygoteRestart: rejecting request from non-root peer {:?}", peer);
+                return Ok(());
+            }
+            info!("Zygote restarted, dropping companions, resetting mount namespaces, and rescanning modules.");
+            context.mount_manager.reset();
+            // Drop the companions first and unconditionally: they served a framework that
+            // no longer exists, and leaving it to the snapshot swap would strand them if
+            // the rescan failed.
+            for module in context.modules().iter() {
+                module.companion.lock().unwrap().take();
+            }
+            context.zn_companions.lock().unwrap().clear();
+            context.zn_states.lock().unwrap().clear();
+            write_zn_state_file(&HashMap::new());
+            // This is the only refresh a zygote restart gets, so a module installed while
+            // the system was up would otherwise wait for a full reboot. A bare stop and
+            // start runs no boot script at all, and `ksud soft-reboot` -- which does replay
+            // post-fs-data and post-mount -- stops zygote before it does, so post-mount.sh
+            // finds no live zygote and sends no rearm.
+            //
+            // It is also the only safe point to swap the set: a module handle is an index
+            // into the list its process read at startup, and a zygote restart takes
+            // system_server and every app holding one down with it.
+            if let Err(e) = context.refresh_modules() {
+                warn!("Serving the previous module snapshot: {:?}", e);
+            }
+        }
+        DaemonSocketAction::SystemServerStarted => {
+            if !matches!(peer, Some(0) | Some(AID_SYSTEM)) {
+                warn!("SystemServerStarted: rejecting request from untrusted peer {:?}", peer);
+                return Ok(());
+            }
+            let value = constants::SYSTEM_SERVER_STARTED;
+            utils::unix_datagram_sendto(CONTROLLER_SOCKET.get().unwrap(), &value.to_le_bytes())?;
+        }
+        DaemonSocketAction::RefreshModules => {
+            if peer != Some(0) {
+                warn!("RefreshModules: rejecting request from non-root peer {:?}", peer);
+                stream.write_u8(0)?;
+                return Ok(());
+            }
+            let ok = match context.refresh_modules() {
+                Ok(_) => 1u8,
+                Err(e) => {
+                    warn!("Failed to refresh the module snapshot: {:?}", e);
+                    0u8
+                }
+            };
+            stream.write_u8(ok)?;
+        }
+        DaemonSocketAction::GetProcessFlags => handle_get_process_flags(&mut stream)?,
+        DaemonSocketAction::UpdateMountNamespace => {
+            handle_update_mount_namespace(&mut stream, context)?;
+        }
+        DaemonSocketAction::ReadModules => {
+            if !matches!(peer, Some(0) | Some(AID_SYSTEM)) {
+                warn!("ReadModules: rejecting request from untrusted peer {:?}", peer);
+                stream.write_usize(0)?;
+                return Ok(());
+            }
+            handle_read_modules(&mut stream, context)?;
+        }
+        DaemonSocketAction::RequestCompanionSocket => {
+            handle_request_companion_socket(&mut stream, context)?;
+        }
+        DaemonSocketAction::RequestZnCompanionSocket => {
+            handle_request_zn_companion_socket(&mut stream, context)?;
+        }
+        DaemonSocketAction::GetModuleDir => {
+            if !matches!(peer, Some(0) | Some(AID_SYSTEM)) {
+                warn!("GetModuleDir: rejecting request from untrusted peer {:?}", peer);
+                return Ok(());
+            }
+            handle_get_module_dir(&mut stream, context)?;
+        }
+        DaemonSocketAction::GetSharedMemoryFd => {
+            if peer != Some(0) {
+                warn!("GetSharedMemoryFd: rejecting request from non-root peer {:?}", peer);
+                stream.write_u8(0)?;
+                return Ok(());
+            }
+            handle_get_shared_memory_fd(&mut stream)?;
+        }
+        DaemonSocketAction::GetZnPlan => {
+            if !matches!(peer, Some(0) | Some(AID_SYSTEM)) {
+                warn!("GetZnPlan: rejecting request from untrusted peer {:?}", peer);
+                stream.write_usize(0)?;
+                return Ok(());
+            }
+            handle_get_zn_plan(&mut stream, context)?;
+        }
+        DaemonSocketAction::ReportZnModule => {
+            if !matches!(peer, Some(0) | Some(AID_SYSTEM)) {
+                warn!("ReportZnModule: rejecting request from untrusted peer {:?}", peer);
+                stream.write_u8(0)?;
+                return Ok(());
+            }
+            handle_report_zn_module(&mut stream, context)?;
+        }
+        DaemonSocketAction::RegisterZnCompanionBroker => {
+            if peer != Some(0) {
+                warn!(
+                    "RegisterZnCompanionBroker: rejecting request from non-root peer {:?}",
+                    peer
+                );
+                stream.write_u8(0)?;
+                return Ok(());
+            }
+            handle_register_zn_companion_broker(&mut stream, context)?;
+        }
+    }
+    Ok(())
+}
+
+/// Initializes global path variables from the daemon work directory.
+fn initialize_globals(tmp_path: Option<&str>, self_exe: PathBuf) -> Result<()> {
+    let tmp_path = match tmp_path {
+        // The normal path: the loader passes the work directory via `--workdir`.
+        Some(path) if !path.is_empty() => path.to_owned(),
+        Some(_) => bail!("TMP_PATH daemon argument is empty"),
+        // Escape hatch for manual invocation without `--workdir`.
+        None => std::env::var("TMP_PATH").context("TMP_PATH environment variable not set")?,
+    };
+    let _ = SELF_EXE.set(self_exe);
+    TMP_PATH.set(tmp_path).unwrap();
+
+    // Prevent two daemon instances for the same ABI from racing on the control socket.
+    let lock_path = format!(
+        "{}/{}",
+        TMP_PATH.get().unwrap(),
+        lp_select!("daemon32.lock", "daemon64.lock")
+    );
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open daemon lock {}", lock_path))?;
+    let ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        bail!(
+            "Another zygiskd instance already holds {}: {}",
+            lock_path,
+            Error::last_os_error()
+        );
+    }
+    let _ = DAEMON_LOCK.set(lock_file);
+
+    CONTROLLER_SOCKET
+        .set(format!("{}/init_monitor", TMP_PATH.get().unwrap()))
+        .unwrap();
+    DAEMON_SOCKET_PATH
+        .set(format!(
+            "{}/{}",
+            TMP_PATH.get().unwrap(),
+            lp_select!("/cp32.sock", "/cp64.sock")
+        ))
+        .unwrap();
+    initialize_shared_memory()?;
+    Ok(())
+}
+
+fn get_kernel_version() -> String {
+    Command::new("/system/bin/uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn get_device_sdk() -> String {
+    utils::get_property("ro.build.version.sdk").unwrap_or_else(|_| "Unknown".to_string())
+}
+
+fn get_device_abi() -> String {
+    let abi = utils::get_property("ro.product.cpu.abi").unwrap_or_else(|_| "Unknown".to_string());
+    let arch = std::env::consts::ARCH;
+    format!("{} ({})", abi, arch)
+}
+
+/// Sends initial status information to the controller.
+fn send_startup_info(modules: &[Module]) -> Result<()> {
+    let mut msg = Vec::<u8>::new();
+    let info = match root_impl::get() {
+        root_impl::RootImpl::APatch
+        | root_impl::RootImpl::KernelSU
+        | root_impl::RootImpl::Magisk => {
+            msg.extend_from_slice(&constants::DAEMON_SET_INFO.to_le_bytes());
+            
+            let mut module_entries = Vec::new();
+            for m in modules {
+                module_entries.push(serde_json::json!({
+                    "name": m.name,
+                    "type": "zygisk",
+                    "target": "zygote",
+                    "companion": false
+                }));
+            }
+
+            // Scan for Zygisk Next modules (zn_modules.txt)
+            if let Ok(dir) = fs::read_dir(constants::PATH_MODULES_DIR) {
+                for entry in dir.flatten() {
+                    let name = entry.file_name().into_string().unwrap_or_default();
+                    let zn_file = entry.path().join("zn_modules.txt");
+                    let disabled = entry.path().join("disable");
+                    let remove = entry.path().join("remove");
+                    if zn_file.exists() && !disabled.exists() && !remove.exists() {
+                        let mut targets = Vec::new();
+                        let mut has_companion = false;
+                        if let Ok(content) = fs::read_to_string(&zn_file) {
+                            for line in content.lines() {
+                                let parts: Vec<&str> = line.split_whitespace().collect();
+                                if parts.len() >= 2 {
+                                    targets.push(parts[0].to_string());
+                                    if parts.iter().any(|&p| p == "companion") {
+                                        has_companion = true;
+                                    }
+                                }
+                            }
+                        }
+                        module_entries.push(serde_json::json!({
+                            "name": name,
+                            "type": "next",
+                            "target": if targets.is_empty() { "unknown".to_string() } else { targets.join(", ") },
+                            "companion": has_companion
+                        }));
+                    }
+                }
+            }
+
+            let modules_json =
+                serde_json::to_string(&module_entries).unwrap_or_else(|_| "[]".to_string());
+            format!(
+                "root_implementation={:?}\nmodules_count={}\nmodules_list={}\ndevice_kernel={}\ndevice_sdk={}\ndevice_abi={}",
+                root_impl::get(),
+                module_entries.len(),
+                modules_json,
+                get_kernel_version(),
+                get_device_sdk(),
+                get_device_abi()
+            )
+        }
+        _ => {
+            msg.extend_from_slice(&constants::DAEMON_SET_ERROR_INFO.to_le_bytes());
+            format!("root_implementation=Invalid({:?})", root_impl::get())
+        }
+    };
+    msg.extend_from_slice(&(info.len() as u32 + 1).to_le_bytes());
+    msg.extend_from_slice(info.as_bytes());
+    msg.push(0); // Null terminator
+    utils::unix_datagram_sendto(CONTROLLER_SOCKET.get().unwrap(), &msg)
+        .context("Failed to send startup info to controller")
+}
+
+/// Detects the device architecture.
+fn get_arch() -> Result<&'static str> {
+    let system_arch = utils::get_property("ro.product.cpu.abi")?;
+    if system_arch.contains("arm") {
+        Ok(lp_select!("armeabi-v7a", "arm64-v8a"))
+    } else if system_arch.contains("x86") {
+        Ok(lp_select!("x86", "x86_64"))
+    } else if system_arch.contains("riscv64") {
+        Ok("riscv64")
+    } else {
+        bail!("Unsupported system architecture: {}", system_arch)
+    }
+}
+
+/// Scans the module directory, loads valid modules, and creates memfds for their libraries.
+fn load_modules() -> Result<Vec<Module>> {
+    let arch = get_arch()?;
+    debug!("Daemon architecture: {arch}");
+
+    let mut modules = Vec::new();
+    let dir = match fs::read_dir(constants::PATH_MODULES_DIR) {
+        Ok(dir) => dir,
+        // No module directory at all means no modules, which is the normal state on a
+        // build with no root framework. Anything else is a failure to read a directory
+        // that does exist, and must be reported rather than passed off as an empty set:
+        // `refresh_modules` would otherwise retire every live module and call it success.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!("No module directory at {}", constants::PATH_MODULES_DIR);
+            return Ok(modules);
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("Failed to read {}", constants::PATH_MODULES_DIR));
+        }
+    };
+
+    for entry in dir.flatten() {
+        let name = entry.file_name().into_string().unwrap_or_default();
+        let so_path = entry.path().join(format!("zygisk/{arch}.so"));
+        let disabled_flag = entry.path().join("disable");
+        let remove_flag = entry.path().join("remove");
+
+        if !so_path.exists() || disabled_flag.exists() || remove_flag.exists() {
+            continue;
+        }
+
+        info!("Loading module `{}`...", name);
+        match create_library_fd(&so_path, "zygisk-module") {
+            Ok(lib_fd) => {
+                modules.push(Module {
+                    name,
+                    lib_fd,
+                    companion: Mutex::new(None),
+                });
+            }
+            Err(e) => {
+                warn!("Failed to create memfd for `{}`: {}", name, e);
+            }
+        };
+    }
+
+    Ok(modules)
+}
+
+/// Creates a sealed, read-only memfd containing the module's shared library.
+/// This is a security measure to prevent the library from being tampered with after loading.
+fn create_library_fd(so_path: &Path, memfd_name: &str) -> Result<OwnedFd> {
+    let opts = memfd::MemfdOptions::default().allow_sealing(true);
+    let memfd = opts.create(memfd_name)?;
+
+    // Copy the library content into the memfd.
+    let file = fs::File::open(so_path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut writer = memfd.as_file();
+    std::io::copy(&mut reader, &mut writer)?;
+
+    // Apply seals to make the memfd immutable.
+    let mut seals = memfd::SealsHashSet::new();
+    seals.insert(memfd::FileSeal::SealShrink);
+    seals.insert(memfd::FileSeal::SealGrow);
+    seals.insert(memfd::FileSeal::SealWrite);
+    seals.insert(memfd::FileSeal::SealSeal);
+
+    if let Err(e) = memfd.add_seals(&seals) {
+        // Ignore errors for the sake of compatibility
+        warn!("Failed to add seals : {}", e);
+    }
+
+    Ok(OwnedFd::from(memfd.into_file()))
+}
+
+/// Creates and binds the main daemon Unix socket.
+fn create_daemon_socket() -> Result<UnixListener> {
+    utils::set_socket_create_context("u:r:zygote:s0")?;
+    let listener = utils::unix_listener_from_path(DAEMON_SOCKET_PATH.get().unwrap());
+    let _ = utils::set_socket_create_context("");
+    listener
+}
+
+fn daemon_exe_path() -> PathBuf {
+    SELF_EXE
+        .get()
+        .cloned()
+        .or_else(|| std::env::args().next().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("zygiskd"))
+}
+
+/// Spawns a companion process for a module: this binary re-executed as
+/// `companion <fd>`, holding one end of a socket pair.
+fn spawn_companion(context: &AppContext, name: &str, lib_fd: RawFd) -> Result<Option<UnixStream>> {
+    let (mut daemon_sock, companion_sock) = UnixStream::pair()?;
+    let _ = daemon_sock.set_read_timeout(Some(COMPANION_HANDSHAKE_TIMEOUT));
+    let _ = daemon_sock.set_write_timeout(Some(COMPANION_HANDSHAKE_TIMEOUT));
+
+    let self_exe = daemon_exe_path();
+    let nice_name = self_exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("zygiskd");
+
+    let companion_fd = companion_sock.as_raw_fd();
+    let mut command = Command::new(&self_exe);
+    command
+        .arg0(format!("{}-{}", nice_name, name))
+        .arg("companion")
+        .arg(companion_fd.to_string());
+    // The socket is the one fd that has to survive exec, and clearing the flag is all a
+    // child forked from a multi-threaded process should do before it is replaced.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(companion_fd, libc::F_SETFD, 0) == -1 {
+                return Err(Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = command.spawn().context("Failed to spawn companion")?;
+    context.pending_companions.lock().unwrap().push(child);
+    // The companion owns its copy now. Keeping ours would deny the read below the EOF it
+    // needs when a companion dies before answering.
+    drop(companion_sock);
+
+    daemon_sock.write_string(name)?;
+    daemon_sock.send_fd(lib_fd)?;
+
+    // Wait for the companion's response to know if it loaded the module successfully.
+    match daemon_sock.read_u8()? {
+        0 => Ok(None), // Module has no companion entry point or failed to load.
+        1 => {
+            let _ = daemon_sock.set_read_timeout(None);
+            let _ = daemon_sock.set_write_timeout(None);
+            Ok(Some(daemon_sock))
+        }
+        _ => bail!("Invalid response from companion setup"),
+    }
+}
+
+// --- Action Handlers ---
+
+fn handle_get_process_flags(stream: &mut UnixStream) -> Result<()> {
+    let uid = stream.read_u32()? as i32;
+
+    // Legitimate callers ask this while still running as zygote/root, before dropping
+    // privileges to `uid`. An already-specialized app connecting directly to this
+    // socket would otherwise be able to probe any other uid's root-grant/denylist
+    // state, so it gets an empty, uncached answer instead.
+    if utils::peer_uid(stream) != Some(0) {
+        warn!("GetProcessFlags: rejecting request from non-root peer for uid {}", uid);
+        stream.write_u32(0)?;
+        return Ok(());
+    }
+
+    let mut flags = ProcessFlags::empty();
+
+    if root_impl::uid_is_manager(uid) {
+        flags |= ProcessFlags::PROCESS_IS_MANAGER;
+    } else {
+        if root_impl::uid_granted_root(uid) {
+            flags |= ProcessFlags::PROCESS_GRANTED_ROOT;
+        }
+        if root_impl::uid_should_umount(uid) {
+            flags |= ProcessFlags::PROCESS_ON_DENYLIST;
+        }
+        if let Some(unmount) = u32::try_from(uid).ok().and_then(exclude::lookup) {
+            flags |= ProcessFlags::PROCESS_EXCLUDED;
+            if unmount {
+                flags |= ProcessFlags::PROCESS_ON_DENYLIST;
+            }
+        }
+    }
+
+    match root_impl::get() {
+        root_impl::RootImpl::APatch => flags |= ProcessFlags::PROCESS_ROOT_IS_APATCH,
+        root_impl::RootImpl::KernelSU => flags |= ProcessFlags::PROCESS_ROOT_IS_KSU,
+        root_impl::RootImpl::Magisk => flags |= ProcessFlags::PROCESS_ROOT_IS_MAGISK,
+        _ => (), // No flag for None, TooOld, or Multiple
+    }
+
+    trace!("Flags for UID {}: {:?}", uid, flags);
+    stream.write_u32(flags.bits())?;
+    if uid >= 0 {
+        cache_process_flags(uid as u32, flags.bits());
+    }
+    Ok(())
+}
+
+fn handle_update_mount_namespace(stream: &mut UnixStream, context: &AppContext) -> Result<()> {
+    let namespace_type = MountNamespace::try_from(stream.read_u8()?)?;
+
+    // Only the zygote/root context, mid-specialize, legitimately needs to setns()
+    // into the cached namespaces (setns itself would fail without CAP_SYS_ADMIN for
+    // anyone else), but there's no reason to hand the fd out at all to a peer that
+    // isn't root.
+    if utils::peer_uid(stream) != Some(0) {
+        warn!("UpdateMountNamespace: rejecting request from non-root peer");
+        stream.write_u8(0)?;
+        return Ok(());
+    }
+
+    if let Some(fd) = context.mount_manager.get_namespace_fd(namespace_type) {
+        // Namespace is already cached, send the FD to the client while keeping Arc<OwnedFd> alive.
+        // SUCCESS: Send Status '1', then the FD.
+        stream.write_u8(1)?;
+        stream.send_fd(fd.as_raw_fd())?;
+    } else {
+        // FAILURE: Send Status '0'.
+        // Do NOT send an FD or random u32 bytes, just stop here.
+        warn!("Namespace {:?} is not cached yet.", namespace_type);
+        stream.write_u8(0)?;
+    }
+    Ok(())
+}
+
+fn handle_read_modules(stream: &mut UnixStream, context: &AppContext) -> Result<()> {
+    // Every injected process comes through here, which is what keeps a companion that
+    // died between refreshes from staying a zombie for long.
+    context.reap_companions();
+    // One snapshot for the whole reply, so the count written first always matches the
+    // number of entries that follow even if a refresh lands mid-reply.
+    let modules = context.modules();
+    stream.write_usize(modules.len())?;
+    for module in modules.iter() {
+        stream.write_string(&module.name)?;
+        stream.send_fd(module.lib_fd.as_raw_fd())?;
+    }
+    Ok(())
+}
+
+/// Resolves a client-supplied module index against a snapshot.
+///
+/// The index comes from a previous `ReadModules` reply, so a client holding one from a
+/// retired snapshot can present an index this one no longer has.
+fn module_at(modules: &Arc<Vec<Module>>, index: usize) -> Result<&Module> {
+    modules
+        .get(index)
+        .with_context(|| format!("Module index {} is out of range ({})", index, modules.len()))
+}
+
+fn handle_request_companion_socket(stream: &mut UnixStream, context: &AppContext) -> Result<()> {
+    let index = stream.read_usize()?;
+    let modules = context.modules();
+    let module = match module_at(&modules, index) {
+        Ok(module) => module,
+        Err(e) => {
+            warn!("{}", e);
+            // Tell the client no companion is available rather than dropping the
+            // connection, which is what it already handles.
+            stream.write_u8(0)?;
+            return Ok(());
+        }
+    };
+    let mut companion = module.companion.lock().unwrap();
+
+    // Check if the existing companion socket is still alive.
+    if let Some(sock) = companion.as_ref() {
+        if !utils::is_socket_alive(sock) {
+            error!(
+                "Companion for module `{}` appears to have crashed.",
+                module.name
+            );
+            companion.take();
+        }
+    }
+
+    // If no companion exists, try to spawn one.
+    if companion.is_none() {
+        match spawn_companion(context, &module.name, module.lib_fd.as_raw_fd()) {
+            Ok(Some(sock)) => {
+                trace!("Spawned new companion for `{}`.", module.name);
+                *companion = Some(sock);
+            }
+            Ok(None) => {
+                warn!(
+                    "Module `{}` does not have a companion entry point.",
+                    module.name
+                );
+            }
+            Err(e) => {
+                warn!("Failed to spawn companion for `{}`: {}", module.name, e);
+            }
+        };
+    }
+
+    // Send the companion FD to the client if available.
+    if let Some(sock) = companion.as_ref() {
+        // Clear daemon IPC timeouts before handing the socket off to a long-lived companion.
+        let _ = stream.set_read_timeout(None);
+        let _ = stream.set_write_timeout(None);
+        if let Err(e) = sock.send_fd(stream.as_raw_fd()) {
+            error!(
+                "Failed to send companion socket FD for module `{}`: {}",
+                module.name, e
+            );
+            // Inform client of failure.
+            stream.write_u8(0)?;
+        }
+        // If successful, the companion itself will notify the client.
+    } else {
+        // Inform client that no companion is available.
+        stream.write_u8(0)?;
+    }
+    Ok(())
+}
+
+/// Verifies that `canonical_lib` is an active ZN module declared with `companion`
+/// inside `/data/adb/modules/*/zn_modules.txt`. Prevents arbitrary `.so` loading as root.
+fn is_allowed_zn_companion(canonical_lib: &Path) -> bool {
+    let Ok(dir) = fs::read_dir(constants::PATH_MODULES_DIR) else {
+        return false;
+    };
+    for entry in dir.flatten() {
+        let mod_dir = entry.path();
+        if mod_dir.join("disable").exists() || mod_dir.join("remove").exists() {
+            continue;
+        }
+        let zn_file = mod_dir.join("zn_modules.txt");
+        let Ok(content) = fs::read_to_string(&zn_file) else {
+            continue;
+        };
+        let Ok(canonical_mod) = fs::canonicalize(&mod_dir) else {
+            continue;
+        };
+        if !canonical_lib.starts_with(&canonical_mod) || canonical_lib == canonical_mod {
+            continue;
+        }
+        for line in content.lines() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.len() < 3 {
+                continue;
+            }
+            if !tokens[1..tokens.len() - 1].contains(&"companion") {
+                continue;
+            }
+            let lib_subpath = tokens.last().unwrap();
+            let candidate = if lib_subpath.starts_with('/') {
+                PathBuf::from(lib_subpath)
+            } else {
+                mod_dir.join(lib_subpath)
+            };
+            if let Ok(resolved) = fs::canonicalize(&candidate) {
+                if resolved == canonical_lib {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Forwards `client_fd` to the ZN companion process for `canonical_lib`, spawning (or
+/// respawning) the companion on demand. Returns `true` if the FD was handed to the
+/// companion (which is then responsible for writing the 1-byte readiness ack), or `false`
+/// if forwarding failed and the caller should fail the client connection.
+fn dispatch_zn_companion_fd(context: &AppContext, canonical_lib: &Path, client_fd: RawFd) -> bool {
+    // Acquire only a per-module mutex so spawning one ZN companion does not block others.
+    let slot = {
+        let mut table = context.zn_companions.lock().unwrap();
+        Arc::clone(
+            table
+                .entry(canonical_lib.to_path_buf())
+                .or_insert_with(|| Arc::new(Mutex::new(None))),
+        )
+    };
+    let mut companion = slot.lock().unwrap();
+
+    if let Some(sock) = companion.as_ref() {
+        if !utils::is_socket_alive(sock) {
+            warn!(
+                "ZN companion for `{}` appears to have crashed.",
+                canonical_lib.display()
+            );
+            companion.take();
+        }
+    }
+
+    if companion.is_none() {
+        context.reap_companions();
+        match spawn_zn_companion(context, canonical_lib) {
+            Ok(Some(sock)) => {
+                trace!(
+                    "Spawned new ZN companion for `{}`.",
+                    canonical_lib.display()
+                );
+                *companion = Some(sock);
+            }
+            Ok(None) => {
+                warn!(
+                    "ZN module `{}` does not have a companion entry point.",
+                    canonical_lib.display()
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to spawn ZN companion for `{}`: {}",
+                    canonical_lib.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    if let Some(sock) = companion.as_ref() {
+        match sock.send_fd(client_fd) {
+            Ok(()) => return true,
+            Err(e) => {
+                error!(
+                    "Failed to send ZN companion FD for `{}`: {}",
+                    canonical_lib.display(),
+                    e
+                );
+                // Drop the broken companion socket so the next request can respawn cleanly.
+                companion.take();
+            }
+        }
+    }
+    false
+}
+
+fn handle_request_zn_companion_socket(stream: &mut UnixStream, context: &AppContext) -> Result<()> {
+    let raw_lib_path = stream.read_string()?;
+    let canonical_lib = match fs::canonicalize(&raw_lib_path) {
+        Ok(p) if is_allowed_zn_companion(&p) => p,
+        _ => {
+            warn!(
+                "RequestZnCompanionSocket: rejecting unregistered ZN companion `{}`",
+                raw_lib_path
+            );
+            stream.write_u8(0)?;
+            return Ok(());
+        }
+    };
+
+    let _ = stream.set_read_timeout(None);
+    let _ = stream.set_write_timeout(None);
+    if !dispatch_zn_companion_fd(context, &canonical_lib, stream.as_raw_fd()) {
+        stream.write_u8(0)?;
+    }
+    // If dispatch succeeded, the companion itself writes the 1-byte readiness ack.
+    Ok(())
+}
+
+fn handle_register_zn_companion_broker(
+    stream: &mut UnixStream,
+    context: &Arc<AppContext>,
+) -> Result<()> {
+    let raw_lib_path = stream.read_string()?;
+    let broker_fd = utils::recv_fd_cloexec(stream.as_raw_fd())
+        .context("RegisterZnCompanionBroker: failed to receive broker FD")?;
+
+    let canonical_lib = match fs::canonicalize(&raw_lib_path) {
+        Ok(p) if is_allowed_zn_companion(&p) => p,
+        _ => {
+            warn!(
+                "RegisterZnCompanionBroker: rejecting unregistered ZN companion `{}`",
+                raw_lib_path
+            );
+            stream.write_u8(0)?;
+            return Ok(());
+        }
+    };
+
+    let mut sock_type: libc::c_int = 0;
+    let mut sock_type_len = size_of::<libc::c_int>() as libc::socklen_t;
+    let getsock_ok = unsafe {
+        libc::getsockopt(
+            broker_fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut sock_type as *mut _ as *mut libc::c_void,
+            &mut sock_type_len,
+        )
+    };
+    if getsock_ok != 0 || sock_type != libc::SOCK_DGRAM {
+        warn!(
+            "RegisterZnCompanionBroker: expected SOCK_DGRAM broker FD for `{}`, got type={}",
+            canonical_lib.display(),
+            sock_type
+        );
+        stream.write_u8(0)?;
+        return Ok(());
+    }
+
+    let mut pipe_fds = [-1 as libc::c_int; 2];
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        let err = Error::last_os_error();
+        warn!(
+            "RegisterZnCompanionBroker: pipe2 failed for `{}`: {}",
+            canonical_lib.display(),
+            err
+        );
+        stream.write_u8(0)?;
+        return Ok(());
+    }
+    let cancel_read = unsafe { std::os::fd::FromRawFd::from_raw_fd(pipe_fds[0]) };
+    let cancel_write = unsafe { std::os::fd::FromRawFd::from_raw_fd(pipe_fds[1]) };
+
+    let broker_ctx = Arc::clone(context);
+    let broker_lib = canonical_lib.clone();
+    match thread::Builder::new()
+        .name("zn-broker".to_string())
+        .spawn(move || {
+            run_zn_companion_broker(broker_fd, cancel_read, broker_lib, broker_ctx);
+        }) {
+        Ok(_) => {
+            // Replacing any previous cancel_write drops its FD, waking any superseded
+            // broker thread (e.g. after a hyos_spawner restart) so it exits cleanly.
+            context
+                .zn_brokers
+                .lock()
+                .unwrap()
+                .insert(canonical_lib.clone(), cancel_write);
+            info!(
+                "Registered ZN companion broker for `{}`",
+                canonical_lib.display()
+            );
+            stream.write_u8(1)?;
+        }
+        Err(e) => {
+            warn!(
+                "Failed to spawn ZN companion broker thread for `{}`: {}",
+                canonical_lib.display(),
+                e
+            );
+            stream.write_u8(0)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_zn_companion_broker(
+    broker_fd: OwnedFd,
+    cancel_read: OwnedFd,
+    canonical_lib: PathBuf,
+    context: Arc<AppContext>,
+) {
+    let mut pfds = [
+        libc::pollfd {
+            fd: broker_fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: cancel_read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+
+    loop {
+        pfds[0].revents = 0;
+        pfds[1].revents = 0;
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
+        if ret < 0 {
+            let err = Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            warn!(
+                "ZN companion broker poll failed for `{}`: {}",
+                canonical_lib.display(),
+                err
+            );
+            break;
+        }
+
+        if pfds[1].revents != 0 {
+            debug!(
+                "ZN companion broker for `{}` superseded, exiting.",
+                canonical_lib.display()
+            );
+            break;
+        }
+
+        if (pfds[0].revents & (libc::POLLERR | libc::POLLNVAL)) != 0 {
+            warn!(
+                "ZN companion broker socket error for `{}` (revents={:#x})",
+                canonical_lib.display(),
+                pfds[0].revents
+            );
+            break;
+        }
+
+        if (pfds[0].revents & libc::POLLIN) != 0 {
+            match utils::recv_fd_cloexec(broker_fd.as_raw_fd()) {
+                Ok(client_fd) => {
+                    if !dispatch_zn_companion_fd(&context, &canonical_lib, client_fd.as_raw_fd()) {
+                        let fail_ack: u8 = 0;
+                        unsafe {
+                            libc::send(
+                                client_fd.as_raw_fd(),
+                                &fail_ack as *const u8 as *const libc::c_void,
+                                1,
+                                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "ZN companion broker recv_fd failed for `{}`: {}",
+                        canonical_lib.display(),
+                        e
+                    );
+                    if e.raw_os_error() == Some(libc::EBADF) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn spawn_zn_companion(context: &AppContext, lib_path: &Path) -> Result<Option<UnixStream>> {
+    let (mut daemon_sock, companion_sock) = UnixStream::pair()?;
+    let _ = daemon_sock.set_read_timeout(Some(COMPANION_HANDSHAKE_TIMEOUT));
+    let _ = daemon_sock.set_write_timeout(Some(COMPANION_HANDSHAKE_TIMEOUT));
+    let self_exe = daemon_exe_path();
+
+    let companion_fd = companion_sock.as_raw_fd();
+    let mut command = Command::new(&self_exe);
+    command
+        .arg0("zygiskd-zn-companion")
+        .arg("zn-companion")
+        .arg(lib_path)
+        .arg(companion_fd.to_string());
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(companion_fd, libc::F_SETFD, 0) == -1 {
+                return Err(Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = command.spawn().context("Failed to spawn ZN companion")?;
+    context.pending_companions.lock().unwrap().push(child);
+    drop(companion_sock);
+
+    match daemon_sock.read_u8()? {
+        0 => Ok(None),
+        1 => {
+            let _ = daemon_sock.set_read_timeout(None);
+            let _ = daemon_sock.set_write_timeout(None);
+            Ok(Some(daemon_sock))
+        }
+        _ => bail!("Invalid response from ZN companion setup"),
+    }
+}
+
+fn handle_get_module_dir(stream: &mut UnixStream, context: &AppContext) -> Result<()> {
+    let index = stream.read_usize()?;
+    let modules = context.modules();
+    let module = module_at(&modules, index)?;
+    let dir_path = format!("{}/{}", constants::PATH_MODULES_DIR, module.name);
+    let dir = fs::File::open(dir_path)?;
+    stream.send_fd(dir.as_raw_fd())?;
+    Ok(())
+}
+
+struct ZnPlanModule {
+    lib_path: String,
+    companion: bool,
+    lib_fd: OwnedFd,
+}
+
+fn is_elf_matching_arch(path: &Path) -> bool {
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    use std::io::Read;
+    let mut header = [0u8; 5];
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    if &header[..4] != b"\x7FELF" {
+        return false;
+    }
+    let expected_class = if cfg!(target_pointer_width = "64") { 2 } else { 1 };
+    header[4] == expected_class
+}
+
+fn scan_zn_modules_for_target(process_name: &str, process_path: &str) -> Result<Vec<ZnPlanModule>> {
+    let mut results = Vec::new();
+    let dir = match fs::read_dir(constants::PATH_MODULES_DIR) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("Failed to read modules directory for ZN: {}", e);
+            return Ok(results);
+        }
+    };
+
+    let mut seen_libs = std::collections::HashSet::new();
+
+    for entry in dir.flatten() {
+        let mod_dir = entry.path();
+        let disabled = mod_dir.join("disable");
+        let remove = mod_dir.join("remove");
+        let zn_file = mod_dir.join("zn_modules.txt");
+
+        if !zn_file.exists() || disabled.exists() || remove.exists() {
+            continue;
+        }
+
+        let content = match fs::read_to_string(&zn_file) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to read {}: {}", zn_file.display(), e);
+                continue;
+            }
+        };
+
+        for line in content.lines() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.len() < 2 {
+                continue;
+            }
+
+            let first = tokens[0];
+            let target_matches = if let Some(target_name) = first.strip_prefix("name=") {
+                if target_name == "zygote" || target_name == "zygote64" || target_name == "zygote32" {
+                    process_name.contains("zygote") || process_name.contains("app_process")
+                } else {
+                    process_name == target_name
+                }
+            } else if let Some(target_path) = first.strip_prefix("path=") {
+                process_path == target_path
+            } else {
+                false
+            };
+
+            if !target_matches {
+                continue;
+            }
+
+            let companion = tokens[1..tokens.len() - 1].contains(&"companion");
+            let lib_subpath = tokens.last().unwrap();
+
+            let candidate = if lib_subpath.starts_with('/') {
+                PathBuf::from(lib_subpath)
+            } else {
+                mod_dir.join(lib_subpath)
+            };
+
+            let canonical_mod = match fs::canonicalize(&mod_dir) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let canonical_lib = match fs::canonicalize(&candidate) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if !canonical_lib.starts_with(&canonical_mod) || canonical_lib == canonical_mod {
+                warn!(
+                    "ZN module lib `{}` is outside module dir `{}`",
+                    canonical_lib.display(),
+                    canonical_mod.display()
+                );
+                continue;
+            }
+
+            if !is_elf_matching_arch(&canonical_lib) {
+                trace!(
+                    "Skipping ZN module lib `{}`: architecture mismatch",
+                    canonical_lib.display()
+                );
+                continue;
+            }
+
+            let lib_path_str = canonical_lib.to_string_lossy().into_owned();
+            if seen_libs.contains(&lib_path_str) {
+                continue;
+            }
+
+            match create_library_fd(&canonical_lib, "zn-module") {
+                Ok(lib_fd) => {
+                    info!(
+                        "ZN: prepared module `{}` for {} (companion={})",
+                        lib_path_str, process_name, companion
+                    );
+                    seen_libs.insert(lib_path_str.clone());
+                    results.push(ZnPlanModule {
+                        lib_path: lib_path_str,
+                        companion,
+                        lib_fd,
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to create memfd for ZN module `{}`: {}", lib_path_str, e);
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+fn handle_get_zn_plan(stream: &mut UnixStream, _context: &AppContext) -> Result<()> {
+    let process_name = stream.read_string()?;
+    let process_path = stream.read_string()?;
+    debug!("GetZnPlan request for process: name={}, path={}", process_name, process_path);
+
+    let matching = scan_zn_modules_for_target(&process_name, &process_path)?;
+    stream.write_usize(matching.len())?;
+
+    for m in matching {
+        stream.write_string(&m.lib_path)?;
+        stream.write_u8(if m.companion { 1 } else { 0 })?;
+        stream.send_fd(m.lib_fd.as_raw_fd())?;
+    }
+    Ok(())
+}
+
+fn write_zn_state_file(states: &HashMap<PathBuf, (u32, u32)>) {
+    let Some(tmp) = TMP_PATH.get() else { return };
+    let mut lines: Vec<String> = states
+        .iter()
+        .map(|(path, (injected, failed))| {
+            let state = if *failed > 0 { "failed" } else if *injected > 0 { "injected" } else { "unknown" };
+            format!("{} {}", state, path.display())
+        })
+        .collect();
+    lines.sort();
+    let target = format!("{}/zn_modules_state", tmp);
+    let staging = format!("{}.tmp", target);
+    let result = fs::write(&staging, lines.join("\n") + "\n").and_then(|_| fs::rename(&staging, &target));
+    if let Err(e) = result {
+        warn!("Failed to write {}: {}", target, e);
+    }
+}
+
+fn handle_report_zn_module(stream: &mut UnixStream, context: &AppContext) -> Result<()> {
+    let raw_lib_path = stream.read_string()?;
+    let injected = stream.read_u8()? != 0;
+
+    // Only canonical paths inside the modules directory are tracked.
+    let modules_dir = fs::canonicalize(constants::PATH_MODULES_DIR)?;
+    if let Ok(lib_path) = fs::canonicalize(&raw_lib_path) {
+        if lib_path.strip_prefix(&modules_dir).is_ok() {
+            let mut states = context.zn_states.lock().unwrap();
+            let entry = states.entry(lib_path.clone()).or_insert((0, 0));
+            if injected {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
+            info!(
+                "ZN: module `{}` {} (injected={}, failed={})",
+                lib_path.display(),
+                if injected { "injected" } else { "failed to load" },
+                entry.0,
+                entry.1
+            );
+            write_zn_state_file(&states);
+        } else {
+            warn!("ZN: ignoring report for `{}` outside the modules directory", lib_path.display());
+        }
+    } else {
+        warn!("ZN: ignoring report for unresolvable path `{}`", raw_lib_path);
+    }
+    stream.write_u8(1)?;
+    Ok(())
+}
+
+fn handle_get_shared_memory_fd(stream: &mut UnixStream) -> Result<()> {
+    if let Some(shm) = SHARED_MEMORY.get() {
+        stream.write_u8(1)?;
+        stream.send_fd(shm.ro_fd.as_raw_fd())?;
+    } else {
+        stream.write_u8(0)?;
+    }
+    Ok(())
+}
+
+fn initialize_shared_memory() -> Result<()> {
+    let size = size_of::<constants::ShmLayout>();
+    let memfd = memfd::MemfdOptions::default()
+        .allow_sealing(true)
+        .create("zygisk-shm")?;
+
+    {
+        let file = memfd.as_file();
+        file.set_len(size as u64)?;
+    }
+
+    let owned_fd = OwnedFd::from(memfd.into_file());
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            owned_fd.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        bail!(
+            "mmap shared memory failed: {}",
+            Error::last_os_error()
+        );
+    }
+
+    // Apply F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_FUTURE_WRITE | F_SEAL_SEAL after our own
+    // writable mapping is established, and hand out a read-only fd opened via /proc/self/fd
+    // so clients can never map or write to zygisk-shm even on kernels without F_SEAL_FUTURE_WRITE.
+    const F_SEAL_FUTURE_WRITE: libc::c_int = 0x0010;
+    let seals_with_future =
+        libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | F_SEAL_FUTURE_WRITE | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(owned_fd.as_raw_fd(), libc::F_ADD_SEALS, seals_with_future) } != 0 {
+        let basic_seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        if unsafe { libc::fcntl(owned_fd.as_raw_fd(), libc::F_ADD_SEALS, basic_seals) } != 0 {
+            warn!(
+                "Failed to add seals to shared memory memfd: {}",
+                Error::last_os_error()
+            );
+        }
+    }
+
+    let ro_fd = fs::File::open(format!("/proc/self/fd/{}", owned_fd.as_raw_fd()))
+        .map(OwnedFd::from)
+        .context("Failed to open read-only handle for shared memory")?;
+
+    let layout = unsafe { &mut *(ptr as *mut constants::ShmLayout) };
+    layout.version.store(0, Ordering::Relaxed);
+    for entry in layout.entries.iter_mut() {
+        entry.uid.store(u32::MAX, Ordering::Relaxed);
+        entry.flags.store(0, Ordering::Relaxed);
+    }
+
+    SHARED_MEMORY
+        .set(SharedShm {
+            _rw_fd: owned_fd,
+            ro_fd,
+            layout: ptr as *mut _,
+            len: size,
+            write_lock: Mutex::new(()),
+        })
+        .map_err(|_| {
+            unsafe {
+                libc::munmap(ptr, size);
+            }
+            anyhow::anyhow!("Shared memory already initialized")
+        })?;
+
+    Ok(())
+}
+
+/// Drops every cached entry so the next `GetProcessFlags` of each uid reaches the daemon.
+fn invalidate_process_flag_cache() {
+    if let Some(shm) = SHARED_MEMORY.get() {
+        let _guard = shm.write_lock.lock().unwrap();
+        let layout = shm.layout();
+        let base_version = layout.version.load(Ordering::Relaxed);
+        layout
+            .version
+            .store(base_version.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+
+        for entry in layout.entries.iter() {
+            entry.uid.store(u32::MAX, Ordering::Relaxed);
+            entry.flags.store(0, Ordering::Relaxed);
+        }
+
+        layout
+            .version
+            .store(base_version.wrapping_add(2), Ordering::Release);
+    }
+}
+
+/// Flushes the flag cache whenever the WebUI rewrites `config.prop`; otherwise a cached
+/// answer would keep serving the old exclusion list until the daemon restarts.
+fn spawn_config_watcher() {
+    thread::spawn(|| {
+        let mut last = exclude::config_mtime();
+        loop {
+            thread::sleep(std::time::Duration::from_secs(1));
+            let current = exclude::config_mtime();
+            if current != last {
+                last = current;
+                // Re-read first so a miss right after the flush sees the new list.
+                exclude::refresh();
+                invalidate_process_flag_cache();
+                debug!("config.prop changed, process flag cache flushed");
+            }
+        }
+    });
+}
+
+fn cache_process_flags(uid: u32, flags: u32) {
+    if let Some(shm) = SHARED_MEMORY.get() {
+        let _guard = shm.write_lock.lock().unwrap();
+        let layout = shm.layout();
+        let base_version = layout.version.load(Ordering::Relaxed);
+        layout
+            .version
+            .store(base_version.wrapping_add(1), Ordering::Relaxed);
+        // Publish the odd version before any entry update becomes visible.
+        fence(Ordering::Release);
+
+        let mask = constants::SHM_HASH_MAP_SIZE - 1;
+        let mut index = (uid as usize) & mask;
+        let start_index = index;
+        let mut inserted = false;
+
+        loop {
+            let entry = &layout.entries[index];
+            let current_uid = entry.uid.load(Ordering::Relaxed);
+            if current_uid == u32::MAX || current_uid == uid {
+                entry.uid.store(uid, Ordering::Relaxed);
+                entry.flags.store(flags, Ordering::Relaxed);
+                inserted = true;
+                break;
+            }
+
+            index = (index + 1) & mask;
+            if index == start_index {
+                break;
+            }
+        }
+
+        if !inserted {
+            warn!("Shared memory cache is full; could not cache uid {}", uid);
+        }
+
+        layout
+            .version
+            .store(base_version.wrapping_add(2), Ordering::Release);
+    }
+}

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dby2-rootctl"
+version = "2.0"
+description = "PC companion tooling for DBY2-W00 temporary root"
+requires-python = ">=3.10"
+dependencies = [
+  "pywebview>=6.0; platform_system == 'Windows'",
+]
+
+[project.scripts]
+dby2-rootctl = "dby2_rootctl.cli:main"
+dby2-rootkit-gui = "dby2_rootctl.web_gui:main"
+
+[tool.setuptools]
+packages = ["dby2_rootctl"]

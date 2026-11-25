@@ -1,0 +1,167 @@
+#include "zn_loader.hpp"
+#include "zn_api.hpp"
+#include "zn_hook.hpp"
+#include "logging.hpp"
+#include "daemon.hpp"
+#include "dl.hpp"
+#include "module_loader.hpp"
+#include "zygisk.hpp"
+#include "zygisk_next_api.h"
+
+#include <dlfcn.h>
+#include <limits.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <string>
+#include <vector>
+
+namespace zn {
+
+namespace {
+
+std::atomic<bool> g_zn_resident{false};
+
+std::string getProcessPath() {
+    char buf[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return {};
+    buf[n] = '\0';
+    std::string p(buf, static_cast<size_t>(n));
+    // Strip the " (deleted)" suffix that the kernel appends when the
+    // on-disk binary has been replaced (e.g. during system updates).
+    constexpr std::string_view kDeleted = " (deleted)";
+    if (p.size() > kDeleted.size() &&
+        p.compare(p.size() - kDeleted.size(), kDeleted.size(), kDeleted) == 0) {
+        p.resize(p.size() - kDeleted.size());
+    }
+    return p;
+}
+
+std::string getProcessName() {
+    const std::string p = getProcessPath();
+    const auto pos = p.rfind('/');
+    return pos == std::string::npos ? p : p.substr(pos + 1);
+}
+
+constexpr char kZnMemfdName[] = "zn-module";
+
+bool loadEntry(const zygiskd::ZnPlanEntry& entry, bool* via_system, bool* unloaded_on_fail) {
+    *via_system = false;
+    *unloaded_on_fail = false;
+    void* lib = modloader::Dlopen(entry.lib_fd.get(), kZnMemfdName, via_system);
+    if (!lib) {
+        LOGE("ZN: load %s (fd %d) failed", entry.lib_path.c_str(), entry.lib_fd.get());
+        zygiskd::ReportZnModule(entry.lib_path, false);
+        return false;
+    }
+
+    auto* m = reinterpret_cast<ZygiskNextModule*>(modloader::Dlsym(lib, "zn_module"));
+    if (!m || !m->onModuleLoaded) {
+        LOGE("ZN: %s does not export zn_module", entry.lib_path.c_str());
+        *unloaded_on_fail = modloader::Dlclose(lib);
+        zygiskd::ReportZnModule(entry.lib_path, false);
+        return false;
+    }
+
+    if (m->target_api_version < 1 || m->target_api_version > ZYGISK_NEXT_API_VERSION) {
+        LOGW("ZN: %s requires API version %d, supported 1..%d", entry.lib_path.c_str(),
+             m->target_api_version, ZYGISK_NEXT_API_VERSION);
+        *unloaded_on_fail = modloader::Dlclose(lib);
+        zygiskd::ReportZnModule(entry.lib_path, false);
+        return false;
+    }
+
+    auto* handle = new ZnModuleHandle();
+    handle->lib_path = entry.lib_path;
+    handle->companion = entry.companion;
+    handle->target_api_version = m->target_api_version;
+
+    if (entry.companion && m->target_api_version < 3) {
+        LOGW("ZN: module %s declares companion but targets API %d (< 3), skipping companion process",
+             entry.lib_path.c_str(), m->target_api_version);
+    } else if (entry.companion && m->target_api_version >= 3 && zn::isHyosRuntime()) {
+        // Specialized hyos_spawner children drop to an app UID and appdomain SELinux
+        // context, where neither DAC nor SEPolicy allows connecting to cp64.sock.
+        // Pre-create a zygote-labeled SOCK_DGRAM socketpair while still root/zygote
+        // and inherit the client end across fork: stock AOSP appdomain policy allows
+        // zygote:fd use + zygote:unix_dgram_socket write with zero extra sepolicy rules.
+        int sv[2] = {-1, -1};
+        if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sv) == 0) {
+            struct timeval tv{
+                .tv_sec = 3,
+                .tv_usec = 0,
+            };
+            setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            if (zygiskd::RegisterZnCompanionBroker(entry.lib_path, sv[1])) {
+                handle->companion_broker_fd = sv[0];
+                LOGI("ZN: registered HYOS companion broker fd=%d for %s", sv[0],
+                     entry.lib_path.c_str());
+            } else {
+                LOGW("ZN: failed to register HYOS companion broker for %s",
+                     entry.lib_path.c_str());
+                close(sv[0]);
+            }
+            close(sv[1]);
+        } else {
+            PLOGE("ZN: socketpair for HYOS companion broker");
+        }
+    }
+
+    const ZygiskNextAPI* api = getApiForVersion(m->target_api_version);
+    g_zn_resident.store(true, std::memory_order_release);
+
+    LOGI("ZN: loading module %s (companion=%s, api=%d)", entry.lib_path.c_str(),
+         entry.companion ? "yes" : "no", m->target_api_version);
+    m->onModuleLoaded(handle, api);
+    zygiskd::ReportZnModule(entry.lib_path, true);
+    return true;
+}
+
+}  // namespace
+
+bool hasResidentState() {
+    return g_zn_resident.load(std::memory_order_acquire) || zn::hook::hasActiveHooks();
+}
+
+void loadAllModules(unsigned char connect_retry) {
+    const std::string proc_name = getProcessName();
+    const std::string proc_path = getProcessPath();
+    LOGI("ZN: requesting boot plan for pid %d (name=%s, path=%s)", getpid(),
+         proc_name.c_str(), proc_path.c_str());
+
+    auto plan = zygiskd::GetZnPlan(proc_name, proc_path, connect_retry);
+    LOGI("ZN: received %zu module(s) from daemon", plan.size());
+
+    size_t system_loaded = 0;
+    size_t system_unloaded = 0;
+    const bool anon_mem = is_anonymous_memory_enabled();
+    for (const auto& entry : plan) {
+        if (entry.lib_fd.get() < 0) continue;
+        bool via_system = false;
+        bool unloaded_on_fail = false;
+        if (loadEntry(entry, &via_system, &unloaded_on_fail)) {
+            if (via_system) {
+                system_loaded++;
+                if (anon_mem) {
+                    spoof_fd_maps(entry.lib_fd.get(), /*private_only=*/true);
+                }
+            }
+        } else if (via_system) {
+            system_loaded++;
+            if (unloaded_on_fail) system_unloaded++;
+        }
+    }
+
+    // Batch the cleanup after the whole plan is processed, same as the regular Zygisk
+    // module path does once for every module instead of per-module. Custom-linker
+    // modules leave no memfd mapping and no solist entry, so only scrub when at least
+    // one module fell back to the system loader.
+    if (system_loaded > 0) {
+        clean_linker_trace(kZnMemfdName, system_loaded, system_unloaded, /*unload_soinfo=*/true);
+    }
+}
+
+}  // namespace zn

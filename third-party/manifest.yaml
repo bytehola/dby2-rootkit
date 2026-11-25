@@ -1,0 +1,60 @@
+schema_version: 2
+
+components:
+  - name: Magisk
+    path: components/magisk
+    purpose: Superuser policy, module runtime, and one-tap root entry
+    source: https://github.com/topjohnwu/Magisk
+    source_commit: a3258d6b9a713d4c3ef7e9db0127a8561088e6a5
+    version: "31.1"
+    license: GPL-3.0-or-later
+
+  - name: Vector
+    path: components/vector
+    purpose: Zygisk Xposed runtime and manager
+    source: https://github.com/JingMatrix/Vector
+    source_commit: 3b03c21ebd4cace8212e28afb87f193babf63b2a
+    version: vcanary-3119
+    license: GPL-3.0
+
+  - name: NyaZygisk
+    path: components/nyazygisk
+    purpose: Zygisk injection host
+    source: https://github.com/Nk-Be/NyaZygisk
+    source_commit: ce72ac8f566bc292f0e92dc69ff1dfbd27cd7570
+    version: v2.6
+    license: GPL-3.0
+
+  - name: DBY2 Root Engine
+    path: components/root-engine
+    purpose: GhostLock temporary root broker
+    source: local-dby2-research
+    license: GPL-3.0-or-later
+
+  - name: DBY2 DirtyFrag
+    path: components/dirtyfrag
+    purpose: Page-cache write primitive and root broker loader
+    sources:
+      - https://github.com/V4bel/dirtyfrag
+      - https://github.com/mitschud/DirtyFrag
+    upstream_commits:
+      V4bel: aab16fcada27142dd8ce8704906cf6736cf213b8
+      mitschud: c724a31914ff5022d1ff95ceb18a6d79f11d5071
+    licenses:
+      local_port: GPL-3.0-or-later
+      mitschud: GPL-2.0-only
+      V4bel: no-license-file-found
+
+  - name: Android Platform Tools
+    purpose: ADB binaries bundled in the Windows release
+    source: https://developer.android.com/tools/releases/platform-tools
+    redistribution: Android SDK license terms
+
+  - name: Xposed modules
+    purpose: Externally installed user modules
+    redistribution: not bundled
+    examples:
+      - XposedFakeLocation
+      - IAmNotADeveloper
+      - App Settings Reborn
+      - Thanox
